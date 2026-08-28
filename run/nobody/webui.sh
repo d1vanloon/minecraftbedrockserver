@@ -1,4 +1,4 @@
-#!/usr/bin/dumb-init /bin/bash
+#!/bin/bash
 
 # script to create a webui minecraft console using utility 'gotty'
 

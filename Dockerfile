@@ -56,5 +56,5 @@ HEALTHCHECK \
 # run
 #####
 
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+ENTRYPOINT ["/usr/bin/catatonit", "--"]
 CMD ["/bin/bash", "/usr/bin/init.sh"]

@@ -1,4 +1,4 @@
-#!/usr/bin/dumb-init /bin/bash
+#!/bin/bash
 
 # source in script to wait for child processes to exit
 source waitproc.sh

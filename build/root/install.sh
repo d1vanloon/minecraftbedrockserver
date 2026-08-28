@@ -31,8 +31,8 @@ pacman -Syu --noconfirm
 pacman -S --needed --noconfirm \
 	awk \
 	ca-certificates \
+	catatonit \
 	curl \
-	dumb-init \
 	grep \
 	gzip \
 	jq \
