@@ -1,0 +1,187 @@
+name: workflow-docker-release
+
+on:
+  workflow_call:
+    inputs:
+      bedrock_version:
+        description: 'Bedrock version key from EndstoneMC, or empty for latest'
+        required: false
+        type: string
+        default: ''
+      bedrock_url:
+        required: false
+        type: string
+        default: ''
+      bedrock_sha256:
+        required: false
+        type: string
+        default: ''
+      push_latest:
+        required: false
+        type: boolean
+        default: true
+      image_tag_override:
+        description: 'If set, push only this tag (manual/test builds)'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      bedrock_version:
+        description: 'Bedrock version key from EndstoneMC, or empty for latest'
+        required: false
+        type: string
+        default: ''
+      push_latest:
+        description: 'Also tag the image as latest'
+        required: false
+        type: boolean
+        default: true
+      image_tag_override:
+        description: 'If set, push only this tag (manual/test builds)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches: [master, main]
+    tags: ['*']
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+concurrency:
+  group: docker-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        id: image
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve Bedrock version
+        id: bedrock
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_VERSION: ${{ inputs.bedrock_version }}
+          SUPPLIED_URL: ${{ inputs.bedrock_url }}
+          SUPPLIED_SHA256: ${{ inputs.bedrock_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${REQUESTED_VERSION}" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            REQUESTED_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          export REQUESTED_VERSION
+          if [[ -n "${SUPPLIED_URL}" && -n "${REQUESTED_VERSION}" ]]; then
+            major_minor="$(echo "${REQUESTED_VERSION}" | awk -F. '{print $1 "." $2}')"
+            {
+              echo "version=${REQUESTED_VERSION}"
+              echo "url=${SUPPLIED_URL}"
+              echo "sha256=${SUPPLIED_SHA256}"
+              echo "major_minor=${major_minor}"
+            } >> "${GITHUB_OUTPUT}"
+            echo "Using caller-supplied download for ${REQUESTED_VERSION}"
+          else
+            chmod +x .github/scripts/resolve-bedrock-release.sh
+            .github/scripts/resolve-bedrock-release.sh
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate tags
+        id: tags
+        env:
+          VERSION: ${{ steps.bedrock.outputs.version }}
+          MAJOR_MINOR: ${{ steps.bedrock.outputs.major_minor }}
+          OVERRIDE: ${{ inputs.image_tag_override }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
+        run: |
+          set -euo pipefail
+          TAGS=()
+          if [[ -n "${OVERRIDE}" ]]; then
+            TAGS+=("type=raw,value=${OVERRIDE}")
+          else
+            TAGS+=("type=raw,value=${VERSION}")
+            if [[ -n "${MAJOR_MINOR}" && "${MAJOR_MINOR}" != "${VERSION}" ]]; then
+              TAGS+=("type=raw,value=${MAJOR_MINOR}")
+            fi
+            if [[ "${PUSH_LATEST}" != "false" ]]; then
+              TAGS+=("type=raw,value=latest")
+            fi
+          fi
+          echo "tags<<EOF" >> "${GITHUB_OUTPUT}"
+          printf '%s\n' "${TAGS[@]}" >> "${GITHUB_OUTPUT}"
+          echo "EOF" >> "${GITHUB_OUTPUT}"
+          echo "Generated tags:"
+          printf '%s\n' "${TAGS[@]}"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          flavor: |
+            latest=false
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=minecraftbedrockserver
+            org.opencontainers.image.description=Arch Linux Minecraft Bedrock Dedicated Server
+            org.opencontainers.image.version=${{ steps.bedrock.outputs.version }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:ci-test
+          build-args: |
+            APPNAME=minecraftbedrockserver
+            RELEASETAG=${{ steps.bedrock.outputs.version }}
+            BEDROCK_URL=${{ steps.bedrock.outputs.url }}
+            BEDROCK_SHA256=${{ steps.bedrock.outputs.sha256 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /bin/bash \
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:ci-test \
+            -c 'test -x /srv/minecraft/bedrock_server && command -v gotty && command -v supervisord'
+
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APPNAME=minecraftbedrockserver
+            RELEASETAG=${{ steps.bedrock.outputs.version }}
+            BEDROCK_URL=${{ steps.bedrock.outputs.url }}
+            BEDROCK_SHA256=${{ steps.bedrock.outputs.sha256 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

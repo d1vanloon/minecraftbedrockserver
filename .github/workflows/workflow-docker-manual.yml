@@ -1,0 +1,24 @@
+name: workflow-docker-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Enter tag name for test/dev image'
+        default: 'test'
+        required: true
+        type: string
+      bedrock_version:
+        description: 'Bedrock version key from EndstoneMC, or empty for latest'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  call-release-workflow:
+    uses: ./.github/workflows/workflow-docker-release.yml
+    with:
+      bedrock_version: ${{ inputs.bedrock_version }}
+      push_latest: false
+      image_tag_override: ${{ inputs.tags }}
+    secrets: inherit

@@ -1,0 +1,97 @@
+name: check-bedrock-release
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if this Bedrock version is already published'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: check-bedrock-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.bedrock.outputs.version }}
+      url: ${{ steps.bedrock.outputs.url }}
+      sha256: ${{ steps.bedrock.outputs.sha256 }}
+      should_build: ${{ steps.compare.outputs.should_build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve latest Bedrock release
+        id: bedrock
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x .github/scripts/resolve-bedrock-release.sh
+          .github/scripts/resolve-bedrock-release.sh
+
+      - name: Compare with published GHCR tags
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.bedrock.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          package="${GITHUB_REPOSITORY##*/}"
+          exists="false"
+
+          if tags="$(gh api --paginate "users/${owner}/packages/container/${package}/versions" \
+            --jq '.[].metadata.container.tags[]' 2>/dev/null)"; then
+            if echo "${tags}" | grep -Fxq "${VERSION}"; then
+              exists="true"
+            fi
+          else
+            echo "Package not published yet, or tags could not be listed."
+          fi
+
+          if [[ "${exists}" != "true" ]]; then
+            image="${GITHUB_REPOSITORY,,}"
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              "https://ghcr.io/v2/${image}/manifests/${VERSION}" || true)"
+            if [[ "${status}" == "200" ]]; then
+              exists="true"
+            fi
+          fi
+
+          if [[ "${FORCE}" == "true" || "${exists}" != "true" ]]; then
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            echo "Will build Bedrock ${VERSION} (exists=${exists}, force=${FORCE})"
+          else
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            echo "GHCR already has ${VERSION}, skipping build."
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/workflow-docker-release.yml
+    with:
+      bedrock_version: ${{ needs.detect.outputs.version }}
+      bedrock_url: ${{ needs.detect.outputs.url }}
+      bedrock_sha256: ${{ needs.detect.outputs.sha256 }}
+      push_latest: true
+    secrets: inherit
