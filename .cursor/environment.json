@@ -1,0 +1,11 @@
+{
+  "name": "Minecraft Bedrock server",
+  "install": "./.cursor/install.sh",
+  "start": "./.cursor/start.sh",
+  "ports": [
+    {
+      "name": "web console",
+      "port": 8222
+    }
+  ]
+}
