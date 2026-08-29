@@ -2,7 +2,7 @@ name: check-bedrock-release
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '56 * * * *'
   workflow_dispatch:
     inputs:
       force:
