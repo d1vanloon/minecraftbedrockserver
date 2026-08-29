@@ -6,7 +6,10 @@
 # overlay driver cannot mount inside the nested container).
 set -euo pipefail
 
-DOCKERD_LOG="${DOCKERD_LOG:-/tmp/dockerd.log}"
+# Log to a root-owned path (not /tmp). dockerd runs as root, and Ubuntu's
+# fs.protected_regular hardening blocks root from writing a differently-owned
+# file inside the sticky, world-writable /tmp.
+DOCKERD_LOG="${DOCKERD_LOG:-/var/log/minecraftbedrockserver-dockerd.log}"
 
 configure_daemon() {
 	sudo mkdir -p /etc/docker
@@ -25,7 +28,7 @@ wait_for_docker() {
 		sleep 1
 	done
 	echo "[dockerd] daemon did not become ready in time; recent log:" >&2
-	tail -n 40 "${DOCKERD_LOG}" >&2 || true
+	sudo tail -n 40 "${DOCKERD_LOG}" >&2 || true
 	return 1
 }
 
@@ -38,6 +41,7 @@ ensure_dockerd() {
 	configure_daemon
 
 	echo "[dockerd] starting daemon (logging to ${DOCKERD_LOG})"
+	sudo mkdir -p "$(dirname "${DOCKERD_LOG}")"
 	sudo sh -c "nohup dockerd >>'${DOCKERD_LOG}' 2>&1 &"
 
 	wait_for_docker
