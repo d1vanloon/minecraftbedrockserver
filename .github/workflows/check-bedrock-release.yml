@@ -1,8 +1,6 @@
 name: check-bedrock-release
 
 on:
-  schedule:
-    - cron: '44 08,10,12,14,15,16,17 * * *'
   workflow_dispatch:
     inputs:
       force:
