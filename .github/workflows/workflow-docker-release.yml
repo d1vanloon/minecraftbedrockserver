@@ -185,3 +185,21 @@ jobs:
             BEDROCK_SHA256=${{ steps.bedrock.outputs.sha256 }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Connect to Tailscale
+        if: inputs.image_tag_override == '' && inputs.push_latest != false
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci,tag:minecraft
+
+      - name: Update Unraid containers
+        if: inputs.image_tag_override == '' && inputs.push_latest != false
+        env:
+          UNRAID_API_URL: ${{ secrets.UNRAID_API_URL }}
+          UNRAID_API_KEY: ${{ secrets.UNRAID_API_KEY }}
+          IMAGE_PREFIX: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+        run: |
+          chmod +x .github/scripts/update-unraid-containers.sh
+          .github/scripts/update-unraid-containers.sh
