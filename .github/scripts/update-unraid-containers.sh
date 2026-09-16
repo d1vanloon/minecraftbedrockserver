@@ -83,10 +83,39 @@ matching_containers() {
 	'
 }
 
-not_running() {
+container_names() {
+	local containers="$1"
+	echo "${containers}" | jq -c '[.[].names[]? | ltrimstr("/")] | unique'
+}
+
+running_containers() {
 	local containers="$1"
 	echo "${containers}" | jq -c '
-		[.[] | select(((.state // "") | ascii_upcase) != "RUNNING")]
+		[.[] | select(((.state // "") | ascii_upcase) == "RUNNING")]
+	'
+}
+
+filter_by_names() {
+	local containers="$1"
+	local names="$2"
+	echo "${containers}" | jq -c --argjson names "${names}" '
+		[.[] | select((.names // []) | map(ltrimstr("/")) | any(. as $n | $names | index($n)))]
+	'
+}
+
+not_running_named() {
+	local containers="$1"
+	local names="$2"
+	echo "${containers}" | jq -c --argjson names "${names}" '
+		. as $containers
+		| [
+			$names[] as $name
+			| ($containers | map(select((.names // []) | map(ltrimstr("/")) | index($name))) | first) as $c
+			| if $c == null then {names: [$name], state: "missing"}
+			  elif (($c.state // "") | ascii_upcase) != "RUNNING" then $c
+			  else empty
+			  end
+		]
 	'
 }
 
@@ -125,10 +154,28 @@ if [[ "${match_count}" -eq 0 ]]; then
 	exit 1
 fi
 
-echo "Found ${match_count} container(s) to update:"
+echo "Found ${match_count} container(s) for image ${IMAGE_PREFIX}:"
 echo "${matches}" | jq -r '.[] | "- \(.names | join(", ")) (\(.id)) image=\(.image) state=\(.state // "unknown")"'
 
-ids="$(echo "${matches}" | jq -c '[.[].id]')"
+targets="$(running_containers "${matches}")"
+target_count="$(echo "${targets}" | jq 'length')"
+skipped_count=$((match_count - target_count))
+
+if [[ "${skipped_count}" -gt 0 ]]; then
+	echo "Skipping ${skipped_count} stopped container(s)"
+	echo "${matches}" | jq -r '.[] | select(((.state // "") | ascii_upcase) != "RUNNING") | "- \(.names | join(", ")) state=\(.state // "unknown")"'
+fi
+
+if [[ "${target_count}" -eq 0 ]]; then
+	echo "No running Unraid containers to update for image ${IMAGE_PREFIX}"
+	exit 0
+fi
+
+echo "Updating ${target_count} running container(s):"
+echo "${targets}" | jq -r '.[] | "- \(.names | join(", ")) (\(.id)) image=\(.image) state=\(.state // "unknown")"'
+
+ids="$(echo "${targets}" | jq -c '[.[].id]')"
+expected_names="$(container_names "${targets}")"
 
 echo "Updating containers via Unraid API"
 update_response="$(graphql "${UPDATE_CONTAINERS_QUERY}" "$(jq -n --argjson ids "${ids}" '{ids: $ids}')" "${UPDATE_TIMEOUT}")"
@@ -146,28 +193,28 @@ fi
 echo "UpdateContainers returned:"
 echo "${updated}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image)"'
 
-confirm_matches="${updated}"
-pending="$(not_running "${confirm_matches}")"
+confirm_matches="$(filter_by_names "${updated}" "${expected_names}")"
+pending="$(not_running_named "${confirm_matches}" "${expected_names}")"
 pending_count="$(echo "${pending}" | jq 'length')"
 
 attempt=0
 while [[ "${pending_count}" -gt 0 && "${attempt}" -lt "${CONFIRM_ATTEMPTS}" ]]; do
 	attempt=$((attempt + 1))
-	echo "Waiting for containers to reach RUNNING (${attempt}/${CONFIRM_ATTEMPTS})"
+	echo "Waiting for updated containers to reach RUNNING (${attempt}/${CONFIRM_ATTEMPTS})"
 	echo "${pending}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown")"'
 	sleep "${CONFIRM_DELAY}"
 	list_response="$(graphql "${GET_CONTAINERS_QUERY}" '{}' "${QUERY_TIMEOUT}" retry)"
 	fail_on_graphql_errors "${list_response}" "GetContainers"
-	confirm_matches="$(matching_containers "${list_response}")"
-	pending="$(not_running "${confirm_matches}")"
+	confirm_matches="$(filter_by_names "$(matching_containers "${list_response}")" "${expected_names}")"
+	pending="$(not_running_named "${confirm_matches}" "${expected_names}")"
 	pending_count="$(echo "${pending}" | jq 'length')"
 done
 
 if [[ "${pending_count}" -gt 0 ]]; then
-	echo "Containers were not RUNNING after update:" >&2
+	echo "Updated containers were not RUNNING after update:" >&2
 	echo "${pending}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown")"' >&2
 	exit 1
 fi
 
-echo "All matching Unraid containers are RUNNING:"
+echo "All updated Unraid containers are RUNNING:"
 echo "${confirm_matches}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image)"'
