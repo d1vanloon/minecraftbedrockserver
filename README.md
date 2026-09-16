@@ -91,7 +91,7 @@ GitHub Actions builds `linux/amd64` images and pushes them to this repository's 
 
 - Push to `master` / `main`, or a version tag, runs `workflow-docker-release`.
 - `workflow-docker-manual` builds a named test tag without moving `latest`.
-- `check-bedrock-release` runs hourly, reads `versions.json` from EndstoneMC/bedrock-server-data, and starts a release build when a new stable Bedrock version is not already on GHCR.
+- `check-bedrock-release` runs on a schedule, reads `versions.json` from EndstoneMC/bedrock-server-data, and starts a release build when a new stable Bedrock version is not already on GHCR.
 
 A local build with no extra args resolves the current stable download during `docker build`.
 
