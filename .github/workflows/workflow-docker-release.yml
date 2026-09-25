@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       bedrock_version:
-        description: 'Bedrock version key from EndstoneMC, or empty for latest'
+        description: 'Bedrock version key (e.g. 1.26.52), or empty for latest from Microsoft'
         required: false
         type: string
         default: ''
@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       bedrock_version:
-        description: 'Bedrock version key from EndstoneMC, or empty for latest'
+        description: 'Bedrock version key (e.g. 1.26.52), or empty for latest from Microsoft'
         required: false
         type: string
         default: ''
@@ -78,6 +78,9 @@ jobs:
           REQUESTED_VERSION: ${{ inputs.bedrock_version }}
           SUPPLIED_URL: ${{ inputs.bedrock_url }}
           SUPPLIED_SHA256: ${{ inputs.bedrock_sha256 }}
+          # Hash the zip when building so images stay integrity-checked even
+          # when the Microsoft API (no checksum field) was the version source.
+          COMPUTE_SHA256: 'true'
         run: |
           set -euo pipefail
           if [[ -z "${REQUESTED_VERSION}" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
@@ -85,11 +88,21 @@ jobs:
           fi
           export REQUESTED_VERSION
           if [[ -n "${SUPPLIED_URL}" && -n "${REQUESTED_VERSION}" ]]; then
-            major_minor="$(echo "${REQUESTED_VERSION}" | awk -F. '{print $1 "." $2}')"
+            sha256="${SUPPLIED_SHA256}"
+            if [[ -z "${sha256}" || "${sha256}" == "null" ]]; then
+              echo "Computing SHA256 for caller-supplied ${SUPPLIED_URL}"
+              tmp="$(mktemp)"
+              curl -fL --retry 12 --retry-delay 10 --connect-timeout 5 --max-time 600 \
+                --user-agent "Mozilla/5.0 (compatible; minecraftbedrockserver-ci/1.0)" \
+                -o "${tmp}" "${SUPPLIED_URL}"
+              sha256="$(sha256sum "${tmp}" | awk '{print $1}')"
+              rm -f "${tmp}"
+            fi
+            major_minor="$(echo "${REQUESTED_VERSION}" | awk -F'[.-]' '{print $1 "." $2}')"
             {
               echo "version=${REQUESTED_VERSION}"
               echo "url=${SUPPLIED_URL}"
-              echo "sha256=${SUPPLIED_SHA256}"
+              echo "sha256=${sha256}"
               echo "major_minor=${major_minor}"
             } >> "${GITHUB_OUTPUT}"
             echo "Using caller-supplied download for ${REQUESTED_VERSION}"

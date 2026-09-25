@@ -13,7 +13,8 @@ ARG RELEASETAG=latest
 # arch from buildx --platform, e.g. amd64
 ARG TARGETARCH=amd64
 
-# optional explicit download (workflow supplies these; local builds resolve from EndstoneMC)
+# optional explicit download (workflow supplies these; local "latest" builds
+# resolve from Microsoft's download API)
 ARG BEDROCK_URL=
 ARG BEDROCK_SHA256=
 

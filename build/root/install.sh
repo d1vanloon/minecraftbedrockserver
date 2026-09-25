@@ -51,32 +51,41 @@ pacman -S --needed --noconfirm \
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 
-# resolve Bedrock dedicated server download from EndstoneMC when the
-# workflow did not pass an explicit URL
+# Resolve Bedrock dedicated server download when the workflow did not pass an
+# explicit URL. Prefer Microsoft's live download API for "latest" (same source
+# as the official download page); fall back to EndstoneMC for pinned versions.
 if [[ -z "${BEDROCK_URL}" ]]; then
-	echo "[info] BEDROCK_URL not set, resolving download from EndstoneMC/bedrock-server-data..."
-	data_branch="$(curl -fsSL --retry 5 --retry-delay 2 --user-agent "${user_agent}" \
-		'https://api.github.com/repos/EndstoneMC/bedrock-server-data' | jq -r '.default_branch')"
-	if [[ -z "${data_branch}" || "${data_branch}" == "null" ]]; then
-		echo "[warn] Unable to resolve EndstoneMC/bedrock-server-data default branch, falling back to v2"
-		data_branch="v2"
-	fi
-
+	ms_api='https://net-secondary.web.minecraft-services.net/api/v1.0/download/links'
 	if [[ "${RELEASETAG}" == "latest" ]]; then
-		RELEASETAG="$(curl -fsSL --retry 5 --retry-delay 2 --user-agent "${user_agent}" \
-			"https://raw.githubusercontent.com/EndstoneMC/bedrock-server-data/${data_branch}/versions.json" \
-			| jq -r '.release.latest')"
-	fi
+		echo "[info] BEDROCK_URL not set, resolving latest download from Microsoft..."
+		BEDROCK_URL="$(curl -fsSL --retry 5 --retry-delay 2 --user-agent "${user_agent}" \
+			"${ms_api}" | jq -r '.result.links[] | select(.downloadType=="serverBedrockLinux") | .downloadUrl')"
+		if [[ -z "${BEDROCK_URL}" || "${BEDROCK_URL}" == "null" ]]; then
+			echo "[warn] Microsoft download API did not return serverBedrockLinux, exiting script..."
+			exit 1
+		fi
+		raw_version="$(basename "${BEDROCK_URL}" | sed -n 's/^bedrock-server-\([0-9.]*\)\.zip$/\1/p')"
+		if [[ -z "${raw_version}" ]]; then
+			echo "[warn] Unable to parse Bedrock version from ${BEDROCK_URL}, exiting script..."
+			exit 1
+		fi
+		# Match Endstone-style tags: 1.26.52.3 -> 1.26.52
+		RELEASETAG="$(echo "${raw_version}" | awk -F. '{print $1 "." $2 "." $3}')"
+		echo "[info] Resolved latest Bedrock ${RELEASETAG} (${BEDROCK_URL})"
+	else
+		echo "[info] BEDROCK_URL not set, resolving ${RELEASETAG} from EndstoneMC/bedrock-server-data..."
+		data_branch="$(curl -fsSL --retry 5 --retry-delay 2 --user-agent "${user_agent}" \
+			'https://api.github.com/repos/EndstoneMC/bedrock-server-data' | jq -r '.default_branch')"
+		if [[ -z "${data_branch}" || "${data_branch}" == "null" ]]; then
+			echo "[warn] Unable to resolve EndstoneMC/bedrock-server-data default branch, falling back to v2"
+			data_branch="v2"
+		fi
 
-	if [[ -z "${RELEASETAG}" || "${RELEASETAG}" == "null" ]]; then
-		echo "[warn] Unable to resolve Bedrock release version, exiting script..."
-		exit 1
+		metadata="$(curl -fsSL --retry 5 --retry-delay 2 --user-agent "${user_agent}" \
+			"https://raw.githubusercontent.com/EndstoneMC/bedrock-server-data/${data_branch}/release/${RELEASETAG}/metadata.json")"
+		BEDROCK_URL="$(echo "${metadata}" | jq -r '.binary.linux.url')"
+		BEDROCK_SHA256="$(echo "${metadata}" | jq -r '.binary.linux.sha256')"
 	fi
-
-	metadata="$(curl -fsSL --retry 5 --retry-delay 2 --user-agent "${user_agent}" \
-		"https://raw.githubusercontent.com/EndstoneMC/bedrock-server-data/${data_branch}/release/${RELEASETAG}/metadata.json")"
-	BEDROCK_URL="$(echo "${metadata}" | jq -r '.binary.linux.url')"
-	BEDROCK_SHA256="$(echo "${metadata}" | jq -r '.binary.linux.sha256')"
 fi
 
 if [[ -z "${BEDROCK_URL}" || "${BEDROCK_URL}" == "null" ]]; then
