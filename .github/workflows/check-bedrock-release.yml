@@ -1,6 +1,10 @@
 name: check-bedrock-release
 
 on:
+  schedule:
+    # Microsoft publishes Bedrock builds as soon as they are ready; poll hourly
+    # so we are not gated on EndstoneMC/bedrock-server-data (daily).
+    - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       force:

@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       bedrock_version:
-        description: 'Bedrock version key from EndstoneMC, or empty for latest'
+        description: 'Bedrock version key (e.g. 1.26.52), or empty for latest from Microsoft'
         required: false
         type: string
         default: ''
