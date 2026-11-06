@@ -6,12 +6,9 @@ QUERY_TIMEOUT="${QUERY_TIMEOUT:-60}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
 CONFIRM_ATTEMPTS="${CONFIRM_ATTEMPTS:-12}"
 CONFIRM_DELAY="${CONFIRM_DELAY:-5}"
-# A cold pull often outlives the reverse proxy in front of the Unraid API
-# (nginx proxy_read_timeout is about 60s). Wait this long after a 504 or a
-# dropped connection before starting another update of the same container.
-GATEWAY_GRACE="${GATEWAY_GRACE:-45}"
+# After a gateway timeout the host may still be pulling. Poll at this interval
+# until the container is RUNNING with a new image, or UPDATE_TIMEOUT expires.
 POLL_DELAY="${POLL_DELAY:-5}"
-MAX_UPDATE_ATTEMPTS="${MAX_UPDATE_ATTEMPTS:-3}"
 
 if [[ -z "${UNRAID_API_URL:-}" ]]; then
 	echo "UNRAID_API_URL is not set" >&2
@@ -147,14 +144,23 @@ append_confirmed() {
 }
 
 fetch_container_response() {
-	local response
-	response="$(graphql "${GET_CONTAINERS_QUERY}" '{}' "${QUERY_TIMEOUT}" retry)"
+	local response status=0
+	# Command substitutions hide exit; fail the caller if the list query fails.
+	response="$(graphql "${GET_CONTAINERS_QUERY}" '{}' "${QUERY_TIMEOUT}" retry)" || status=$?
+	if [[ "${status}" -ne 0 ]]; then
+		exit "${status}"
+	fi
 	fail_on_graphql_errors "${response}" "GetContainers"
 	printf '%s\n' "${response}"
 }
 
 list_matches() {
-	matching_containers "$(fetch_container_response)"
+	local response status=0
+	response="$(fetch_container_response)" || status=$?
+	if [[ "${status}" -ne 0 ]]; then
+		exit "${status}"
+	fi
+	matching_containers "${response}"
 }
 
 remaining_budget() {
@@ -197,26 +203,29 @@ confirm_running() {
 		if [[ "${CONFIRM_DELAY}" -gt 0 ]]; then
 			sleep "${CONFIRM_DELAY}"
 		fi
-		containers="$(list_matches)"
+		containers="$(list_matches)" || exit $?
 	done
 }
 
-# After a gateway timeout, the update may still be running on the host.
-# Returns 0 when the container is RUNNING with a new imageId or created time.
-# Returns 1 when the grace period ends with no image change, so the caller can retry.
-# A container whose image already changed keeps being polled until it is RUNNING.
+# After a gateway timeout the host may still be pulling. Keep polling until the
+# container is RUNNING with a new imageId/created time, or the overall deadline
+# expires. Do not start another update while the first may still be in flight.
 poll_until_updated() {
 	local name="$1"
 	local old_image_id="$2"
 	local old_created="$3"
-	local grace_deadline matches container state
-	grace_deadline=$(( $(date +%s) + GATEWAY_GRACE ))
+	local matches container state status
+
 	while true; do
 		if [[ "$(remaining_budget)" -le 0 ]]; then
 			echo "Timed out waiting for ${name} to finish updating" >&2
 			exit 1
 		fi
-		matches="$(list_matches)"
+		status=0
+		matches="$(list_matches)" || status=$?
+		if [[ "${status}" -ne 0 ]]; then
+			exit "${status}"
+		fi
 		container="$(container_record "${matches}" "${name}")"
 		if [[ -n "${container}" ]] && container_image_changed "${container}" "${old_image_id}" "${old_created}"; then
 			state="$(echo "${container}" | jq -r '(.state // "") | ascii_upcase')"
@@ -226,9 +235,8 @@ poll_until_updated() {
 				return 0
 			fi
 			echo "Waiting for ${name} to reach RUNNING (state=${state})"
-		elif [[ "$(date +%s)" -ge "${grace_deadline}" ]]; then
-			echo "Image id for ${name} unchanged after ${GATEWAY_GRACE}s; retrying update" >&2
-			return 1
+		else
+			echo "Waiting for ${name} image update to finish"
 		fi
 		if [[ "${POLL_DELAY}" -gt 0 ]]; then
 			sleep "${POLL_DELAY}"
@@ -243,46 +251,37 @@ update_one() {
 	local name="$2"
 	local old_image_id="$3"
 	local old_created="$4"
-	local attempt=0
-	local update_status update_response updated remaining
+	local update_status=0
+	local update_response updated remaining
 
-	while [[ "${attempt}" -lt "${MAX_UPDATE_ATTEMPTS}" ]]; do
-		attempt=$((attempt + 1))
-		remaining="$(remaining_budget)"
-		if [[ "${remaining}" -le 0 ]]; then
-			echo "Update timeout exceeded before updating ${name}" >&2
+	remaining="$(remaining_budget)"
+	if [[ "${remaining}" -le 0 ]]; then
+		echo "Update timeout exceeded before updating ${name}" >&2
+		exit 1
+	fi
+	echo "Updating ${name} via Unraid API"
+	update_response="$(graphql "${UPDATE_CONTAINER_QUERY}" \
+		"$(jq -n --arg id "${id}" '{id: $id}')" \
+		"${remaining}" "" allow-gateway-timeout)" || update_status=$?
+	if [[ "${update_status}" -eq 0 ]]; then
+		fail_on_graphql_errors "${update_response}" "UpdateContainer"
+		updated="$(echo "${update_response}" | jq -c '.data.docker.updateContainer // empty')"
+		if [[ -z "${updated}" ]]; then
+			echo "UpdateContainer returned no container for ${name}" >&2
+			echo "${update_response}" | jq . >&2
 			exit 1
 		fi
-		echo "Updating ${name} via Unraid API (attempt ${attempt}/${MAX_UPDATE_ATTEMPTS})"
-		update_status=0
-		update_response="$(graphql "${UPDATE_CONTAINER_QUERY}" \
-			"$(jq -n --arg id "${id}" '{id: $id}')" \
-			"${remaining}" "" allow-gateway-timeout)" || update_status=$?
-		if [[ "${update_status}" -eq 0 ]]; then
-			fail_on_graphql_errors "${update_response}" "UpdateContainer"
-			updated="$(echo "${update_response}" | jq -c '.data.docker.updateContainer // empty')"
-			if [[ -z "${updated}" ]]; then
-				echo "UpdateContainer returned no container for ${name}" >&2
-				echo "${update_response}" | jq . >&2
-				exit 1
-			fi
-			echo "UpdateContainer returned:"
-			echo "${updated}" | jq -r '"- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image) imageId=\(.imageId // "unknown")"'
-			confirm_running "${name}" "$(jq -c '[.]' <<<"${updated}")"
-			return 0
-		fi
-		if [[ "${update_status}" -eq 2 ]]; then
-			echo "Gateway timed out updating ${name}; polling for the new image"
-			if poll_until_updated "${name}" "${old_image_id}" "${old_created}"; then
-				return 0
-			fi
-		else
-			echo "UpdateContainer failed for ${name}" >&2
-			exit 1
-		fi
-	done
-
-	echo "Container ${name} was not updated after ${MAX_UPDATE_ATTEMPTS} attempts" >&2
+		echo "UpdateContainer returned:"
+		echo "${updated}" | jq -r '"- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image) imageId=\(.imageId // "unknown")"'
+		confirm_running "${name}" "$(jq -c '[.]' <<<"${updated}")"
+		return 0
+	fi
+	if [[ "${update_status}" -eq 2 ]]; then
+		echo "Gateway timed out updating ${name}; polling for the new image"
+		poll_until_updated "${name}" "${old_image_id}" "${old_created}"
+		return 0
+	fi
+	echo "UpdateContainer failed for ${name}" >&2
 	exit 1
 }
 
