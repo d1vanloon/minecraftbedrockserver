@@ -6,6 +6,9 @@ QUERY_TIMEOUT="${QUERY_TIMEOUT:-60}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
 CONFIRM_ATTEMPTS="${CONFIRM_ATTEMPTS:-12}"
 CONFIRM_DELAY="${CONFIRM_DELAY:-5}"
+# After a gateway timeout the host may still be pulling. Poll at this interval
+# until the container is RUNNING with a new image, or UPDATE_TIMEOUT expires.
+POLL_DELAY="${POLL_DELAY:-5}"
 
 if [[ -z "${UNRAID_API_URL:-}" ]]; then
 	echo "UNRAID_API_URL is not set" >&2
@@ -21,12 +24,15 @@ if [[ "${api_url}" != */graphql ]]; then
 	api_url="${api_url}/graphql"
 fi
 
+confirmed='[]'
+
 graphql() {
 	local query="$1"
 	local variables="$2"
 	local max_time="${3:-${QUERY_TIMEOUT}}"
 	local retry="${4:-}"
-	local payload http_code body
+	local allow_gateway="${5:-}"
+	local payload http_code body curl_status
 	local -a curl_args=(
 		-sS --show-error
 		--connect-timeout 15 --max-time "${max_time}"
@@ -48,16 +54,35 @@ graphql() {
 	fi
 
 	body="$(mktemp)"
-	http_code="$(curl "${curl_args[@]}" -o "${body}" -w '%{http_code}' --data "${payload}")"
+	curl_status=0
+	http_code="$(curl "${curl_args[@]}" -o "${body}" -w '%{http_code}' --data "${payload}")" || curl_status=$?
+	if [[ "${curl_status}" -ne 0 || -z "${http_code}" || "${http_code}" == "000" ]]; then
+		echo "Unraid API request failed (curl status ${curl_status})" >&2
+		if [[ -s "${body}" ]]; then
+			cat "${body}" >&2
+			echo >&2
+		fi
+		rm -f "${body}"
+		if [[ "${allow_gateway}" == "allow-gateway-timeout" ]]; then
+			return 2
+		fi
+		exit 1
+	fi
 	if [[ "${http_code}" != "200" ]]; then
 		echo "Unraid API HTTP ${http_code}" >&2
 		cat "${body}" >&2
+		echo >&2
 		rm -f "${body}"
+		# 504 means the proxy gave up. Unraid may still be pulling and recreating.
+		if [[ "${http_code}" == "504" && "${allow_gateway}" == "allow-gateway-timeout" ]]; then
+			return 2
+		fi
 		exit 1
 	fi
 	if ! jq -e . "${body}" >/dev/null 2>&1; then
 		echo "Unraid API did not return JSON" >&2
 		cat "${body}" >&2
+		echo >&2
 		rm -f "${body}"
 		exit 1
 	fi
@@ -83,11 +108,6 @@ matching_containers() {
 	'
 }
 
-container_names() {
-	local containers="$1"
-	echo "${containers}" | jq -c '[.[].names[]? | ltrimstr("/")] | unique'
-}
-
 running_containers() {
 	local containers="$1"
 	echo "${containers}" | jq -c '
@@ -95,28 +115,174 @@ running_containers() {
 	'
 }
 
-filter_by_names() {
+container_record() {
 	local containers="$1"
-	local names="$2"
-	echo "${containers}" | jq -c --argjson names "${names}" '
-		[.[] | select((.names // []) | map(ltrimstr("/")) | any(. as $n | $names | index($n)))]
+	local name="$2"
+	echo "${containers}" | jq -c --arg name "${name}" '
+		([.[] | select((.names // []) | map(ltrimstr("/")) | index($name))] | first // empty)
 	'
 }
 
-not_running_named() {
-	local containers="$1"
-	local names="$2"
-	echo "${containers}" | jq -c --argjson names "${names}" '
-		. as $containers
-		| [
-			$names[] as $name
-			| ($containers | map(select((.names // []) | map(ltrimstr("/")) | index($name))) | first) as $c
-			| if $c == null then {names: [$name], state: "missing"}
-			  elif (($c.state // "") | ascii_upcase) != "RUNNING" then $c
-			  else empty
-			  end
-		]
-	'
+container_image_changed() {
+	local container="$1"
+	local old_image_id="$2"
+	local old_created="$3"
+	echo "${container}" | jq -e \
+		--arg old_image "${old_image_id}" \
+		--arg old_created "${old_created}" '
+		. != null
+			and (
+				(((.imageId // "") | tostring) != "" and ((.imageId | tostring) != $old_image))
+				or (((.created // "") | tostring) != "" and ((.created | tostring) != $old_created))
+			)
+	' >/dev/null
+}
+
+append_confirmed() {
+	local container="$1"
+	confirmed="$(jq -c --argjson item "${container}" '. + [$item]' <<<"${confirmed}")"
+}
+
+fetch_container_response() {
+	local response status=0
+	# Command substitutions hide exit; fail the caller if the list query fails.
+	response="$(graphql "${GET_CONTAINERS_QUERY}" '{}' "${QUERY_TIMEOUT}" retry)" || status=$?
+	if [[ "${status}" -ne 0 ]]; then
+		exit "${status}"
+	fi
+	fail_on_graphql_errors "${response}" "GetContainers"
+	printf '%s\n' "${response}"
+}
+
+list_matches() {
+	local response status=0
+	response="$(fetch_container_response)" || status=$?
+	if [[ "${status}" -ne 0 ]]; then
+		exit "${status}"
+	fi
+	matching_containers "${response}"
+}
+
+remaining_budget() {
+	echo $(( update_deadline - $(date +%s) ))
+}
+
+# A container that has not reappeared yet is reported as state=missing.
+pending_line() {
+	local name="$1"
+	local container="$2"
+	if [[ -z "${container}" ]]; then
+		container="$(jq -nc --arg name "${name}" '{names:[$name], state:"missing"}')"
+	fi
+	echo "${container}" | jq -r '"- \(.names | join(", ")) state=\(.state // "unknown")"'
+}
+
+confirm_running() {
+	local name="$1"
+	local containers="$2"
+	local attempt=0
+	local container state
+
+	while true; do
+		container="$(container_record "${containers}" "${name}")"
+		if [[ -n "${container}" ]]; then
+			state="$(echo "${container}" | jq -r '(.state // "") | ascii_upcase')"
+			if [[ "${state}" == "RUNNING" ]]; then
+				append_confirmed "${container}"
+				return 0
+			fi
+		fi
+		if [[ "${attempt}" -ge "${CONFIRM_ATTEMPTS}" ]]; then
+			echo "Updated containers were not RUNNING after update:" >&2
+			pending_line "${name}" "${container}" >&2
+			exit 1
+		fi
+		attempt=$((attempt + 1))
+		echo "Waiting for ${name} to reach RUNNING (${attempt}/${CONFIRM_ATTEMPTS})"
+		pending_line "${name}" "${container}"
+		if [[ "${CONFIRM_DELAY}" -gt 0 ]]; then
+			sleep "${CONFIRM_DELAY}"
+		fi
+		containers="$(list_matches)" || exit $?
+	done
+}
+
+# After a gateway timeout the host may still be pulling. Keep polling until the
+# container is RUNNING with a new imageId/created time, or the overall deadline
+# expires. Do not start another update while the first may still be in flight.
+poll_until_updated() {
+	local name="$1"
+	local old_image_id="$2"
+	local old_created="$3"
+	local matches container state status
+
+	while true; do
+		if [[ "$(remaining_budget)" -le 0 ]]; then
+			echo "Timed out waiting for ${name} to finish updating" >&2
+			exit 1
+		fi
+		status=0
+		matches="$(list_matches)" || status=$?
+		if [[ "${status}" -ne 0 ]]; then
+			exit "${status}"
+		fi
+		container="$(container_record "${matches}" "${name}")"
+		if [[ -n "${container}" ]] && container_image_changed "${container}" "${old_image_id}" "${old_created}"; then
+			state="$(echo "${container}" | jq -r '(.state // "") | ascii_upcase')"
+			if [[ "${state}" == "RUNNING" ]]; then
+				append_confirmed "${container}"
+				echo "${name} is RUNNING with an updated image"
+				return 0
+			fi
+			echo "Waiting for ${name} to reach RUNNING (state=${state})"
+		else
+			echo "Waiting for ${name} image update to finish"
+		fi
+		if [[ "${POLL_DELAY}" -gt 0 ]]; then
+			sleep "${POLL_DELAY}"
+		else
+			sleep 1
+		fi
+	done
+}
+
+update_one() {
+	local id="$1"
+	local name="$2"
+	local old_image_id="$3"
+	local old_created="$4"
+	local update_status=0
+	local update_response updated remaining
+
+	remaining="$(remaining_budget)"
+	if [[ "${remaining}" -le 0 ]]; then
+		echo "Update timeout exceeded before updating ${name}" >&2
+		exit 1
+	fi
+	echo "Updating ${name} via Unraid API"
+	update_response="$(graphql "${UPDATE_CONTAINER_QUERY}" \
+		"$(jq -n --arg id "${id}" '{id: $id}')" \
+		"${remaining}" "" allow-gateway-timeout)" || update_status=$?
+	if [[ "${update_status}" -eq 0 ]]; then
+		fail_on_graphql_errors "${update_response}" "UpdateContainer"
+		updated="$(echo "${update_response}" | jq -c '.data.docker.updateContainer // empty')"
+		if [[ -z "${updated}" ]]; then
+			echo "UpdateContainer returned no container for ${name}" >&2
+			echo "${update_response}" | jq . >&2
+			exit 1
+		fi
+		echo "UpdateContainer returned:"
+		echo "${updated}" | jq -r '"- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image) imageId=\(.imageId // "unknown")"'
+		confirm_running "${name}" "$(jq -c '[.]' <<<"${updated}")"
+		return 0
+	fi
+	if [[ "${update_status}" -eq 2 ]]; then
+		echo "Gateway timed out updating ${name}; polling for the new image"
+		poll_until_updated "${name}" "${old_image_id}" "${old_created}"
+		return 0
+	fi
+	echo "UpdateContainer failed for ${name}" >&2
+	exit 1
 }
 
 GET_CONTAINERS_QUERY='query GetContainers {
@@ -125,26 +291,28 @@ GET_CONTAINERS_QUERY='query GetContainers {
       id
       names
       image
+      imageId
+      created
       state
     }
   }
 }'
 
-UPDATE_CONTAINERS_QUERY='mutation UpdateContainers($ids: [PrefixedID!]!) {
+UPDATE_CONTAINER_QUERY='mutation UpdateContainer($id: PrefixedID!) {
   docker {
-    updateContainers(ids: $ids) {
+    updateContainer(id: $id) {
       id
       names
       state
       image
+      imageId
+      created
     }
   }
 }'
 
 echo "Querying Unraid Docker containers"
-list_response="$(graphql "${GET_CONTAINERS_QUERY}" '{}' "${QUERY_TIMEOUT}" retry)"
-fail_on_graphql_errors "${list_response}" "GetContainers"
-
+list_response="$(fetch_container_response)"
 matches="$(matching_containers "${list_response}")"
 match_count="$(echo "${matches}" | jq 'length')"
 
@@ -155,7 +323,7 @@ if [[ "${match_count}" -eq 0 ]]; then
 fi
 
 echo "Found ${match_count} container(s) for image ${IMAGE_PREFIX}:"
-echo "${matches}" | jq -r '.[] | "- \(.names | join(", ")) (\(.id)) image=\(.image) state=\(.state // "unknown")"'
+echo "${matches}" | jq -r '.[] | "- \(.names | join(", ")) (\(.id)) image=\(.image) imageId=\(.imageId // "unknown") state=\(.state // "unknown")"'
 
 targets="$(running_containers "${matches}")"
 target_count="$(echo "${targets}" | jq 'length')"
@@ -172,49 +340,21 @@ if [[ "${target_count}" -eq 0 ]]; then
 fi
 
 echo "Updating ${target_count} running container(s):"
-echo "${targets}" | jq -r '.[] | "- \(.names | join(", ")) (\(.id)) image=\(.image) state=\(.state // "unknown")"'
+echo "${targets}" | jq -r '.[] | "- \(.names | join(", ")) (\(.id)) image=\(.image) imageId=\(.imageId // "unknown") state=\(.state // "unknown")"'
 
-ids="$(echo "${targets}" | jq -c '[.[].id]')"
-expected_names="$(container_names "${targets}")"
+update_deadline=$(( $(date +%s) + UPDATE_TIMEOUT ))
 
-echo "Updating containers via Unraid API"
-update_response="$(graphql "${UPDATE_CONTAINERS_QUERY}" "$(jq -n --argjson ids "${ids}" '{ids: $ids}')" "${UPDATE_TIMEOUT}")"
-fail_on_graphql_errors "${update_response}" "UpdateContainers"
-
-updated="$(echo "${update_response}" | jq -c '.data.docker.updateContainers // []')"
-updated_count="$(echo "${updated}" | jq 'length')"
-
-if [[ "${updated_count}" -eq 0 ]]; then
-	echo "UpdateContainers returned no containers" >&2
-	echo "${update_response}" | jq . >&2
-	exit 1
-fi
-
-echo "UpdateContainers returned:"
-echo "${updated}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image)"'
-
-confirm_matches="$(filter_by_names "${updated}" "${expected_names}")"
-pending="$(not_running_named "${confirm_matches}" "${expected_names}")"
-pending_count="$(echo "${pending}" | jq 'length')"
-
-attempt=0
-while [[ "${pending_count}" -gt 0 && "${attempt}" -lt "${CONFIRM_ATTEMPTS}" ]]; do
-	attempt=$((attempt + 1))
-	echo "Waiting for updated containers to reach RUNNING (${attempt}/${CONFIRM_ATTEMPTS})"
-	echo "${pending}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown")"'
-	sleep "${CONFIRM_DELAY}"
-	list_response="$(graphql "${GET_CONTAINERS_QUERY}" '{}' "${QUERY_TIMEOUT}" retry)"
-	fail_on_graphql_errors "${list_response}" "GetContainers"
-	confirm_matches="$(filter_by_names "$(matching_containers "${list_response}")" "${expected_names}")"
-	pending="$(not_running_named "${confirm_matches}" "${expected_names}")"
-	pending_count="$(echo "${pending}" | jq 'length')"
-done
-
-if [[ "${pending_count}" -gt 0 ]]; then
-	echo "Updated containers were not RUNNING after update:" >&2
-	echo "${pending}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown")"' >&2
-	exit 1
-fi
+while IFS= read -r target; do
+	id="$(echo "${target}" | jq -r '.id')"
+	name="$(echo "${target}" | jq -r '.names[0] // "" | ltrimstr("/")')"
+	old_image_id="$(echo "${target}" | jq -r '(.imageId // "") | tostring')"
+	old_created="$(echo "${target}" | jq -r '(.created // "") | tostring')"
+	if [[ -z "${name}" ]]; then
+		echo "Container ${id} has no name" >&2
+		exit 1
+	fi
+	update_one "${id}" "${name}" "${old_image_id}" "${old_created}"
+done < <(echo "${targets}" | jq -c '.[]')
 
 echo "All updated Unraid containers are RUNNING:"
-echo "${confirm_matches}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image)"'
+echo "${confirmed}" | jq -r '.[] | "- \(.names | join(", ")) state=\(.state // "unknown") image=\(.image) imageId=\(.imageId // "unknown")"'
