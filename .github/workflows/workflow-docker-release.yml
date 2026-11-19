@@ -201,7 +201,7 @@ jobs:
 
       - name: Connect to Tailscale
         if: inputs.image_tag_override == '' && inputs.push_latest != false
-        uses: tailscale/github-action@v2
+        uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
